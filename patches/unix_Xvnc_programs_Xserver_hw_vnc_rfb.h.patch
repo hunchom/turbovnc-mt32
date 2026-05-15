@@ -1,0 +1,21 @@
+diff --git a/unix/Xvnc/programs/Xserver/hw/vnc/rfb.h b/unix/Xvnc/programs/Xserver/hw/vnc/rfb.h
+index baec688..2047083 100644
+--- a/unix/Xvnc/programs/Xserver/hw/vnc/rfb.h
++++ b/unix/Xvnc/programs/Xserver/hw/vnc/rfb.h
+@@ -87,7 +87,7 @@
+ 
+ /* Maximum number of threads to use for multithreaded encoding, regardless of
+    the CPU count */
+-#define MAX_ENCODING_THREADS 4
++#define MAX_ENCODING_THREADS 32
+ 
+ /* Maximum number of client connections.  The default of 100 should be more
+    than enough for most use cases.  The ceiling is set to 500 to give us plenty
+@@ -416,6 +416,7 @@ typedef struct rfbClientRec {
+ 
+   /* tight encoding -- preserve zlib streams' state for each client */
+ 
++  unsigned int generation;          /* monotonic client-identity token */
+   z_stream zsStruct[4];
+   Bool zsActive[4];
+   int zsLevel[4];

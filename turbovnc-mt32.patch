@@ -1,0 +1,312 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8aa9e8b..b699492 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -6,8 +6,8 @@ cmake_minimum_required(VERSION 3.16...3.28)
+ 
+ project(TurboVNC NONE)
+ string(TOLOWER ${CMAKE_PROJECT_NAME} CMAKE_PROJECT_NAME_LC)
+-set(VERSION 3.3.1)
+-set(DOCVERSION 3.3.1)
++set(VERSION 3.3.1.mt32)
++set(DOCVERSION 3.3.1.mt32)
+ set(COPYRIGHT_YEAR "1999-2026")
+ set(COPYRIGHT "The VirtualGL Project and many others (see README.md)")
+ set(URLTEXT "Visit http://www.TurboVNC.org for more information on TurboVNC")
+diff --git a/java/com/turbovnc/rfb/TightDecoder.java b/java/com/turbovnc/rfb/TightDecoder.java
+index ea66191..6f10a41 100644
+--- a/java/com/turbovnc/rfb/TightDecoder.java
++++ b/java/com/turbovnc/rfb/TightDecoder.java
+@@ -141,7 +141,7 @@ public class TightDecoder extends Decoder {
+     // Flush zlib streams if we are told by the server to do so.
+     for (int i = 0; i < 4; i++) {
+       if ((compCtl & 1) != 0)
+-        inflater[i].end();
++        inflater[i].reset();
+       compCtl >>= 1;
+     }
+ 
+diff --git a/unix/Xvnc/programs/Xserver/Xvnc.man.in b/unix/Xvnc/programs/Xserver/Xvnc.man.in
+index 8dcd290..3052980 100644
+--- a/unix/Xvnc/programs/Xserver/Xvnc.man.in
++++ b/unix/Xvnc/programs/Xserver/Xvnc.man.in
+@@ -373,10 +373,10 @@ Disable multithreaded Tight encoding
+ .TP
+ \fB\-nthreads\fR \fIthread-count\fR
+ Specify the number of threads to use with multithreaded Tight encoding.  The
+-default is to use one thread per CPU core, up to a maximum of 4 (because using
+-more than 4 encoding threads breaks compatibility with viewers other than the
+-TurboVNC Viewer.)  The server will not allow the thread count to exceed 4, nor
+-to exceed the number of CPU cores.
++default is to use one thread per CPU core, up to a maximum of 32.  The server
++will not allow the thread count to exceed 32, nor to exceed the number of CPU
++cores.  Using more than 4 encoding threads requires the TurboVNC Viewer; other
++viewers support a maximum of 4 Tight zlib streams.
+ 
+ .TP
+ \fBTURBOVNC SECURITY AND AUTHENTICATION OPTIONS\fR
+diff --git a/unix/Xvnc/programs/Xserver/hw/vnc/init.c b/unix/Xvnc/programs/Xserver/hw/vnc/init.c
+index c42e7ce..6651f07 100644
+--- a/unix/Xvnc/programs/Xserver/hw/vnc/init.c
++++ b/unix/Xvnc/programs/Xserver/hw/vnc/init.c
+@@ -1897,7 +1897,7 @@ void ddxUseMsg(void)
+   ErrorF("-nthreads N            specify number of threads (1 <= N <= %d) to use with\n",
+          MAX_ENCODING_THREADS);
+   ErrorF("                       multithreaded Tight encoding [default: 1 per CPU core,\n");
+-  ErrorF("                       max. 4]\n");
++  ErrorF("                       max. %d]\n", MAX_ENCODING_THREADS);
+ #endif
+ 
+   ErrorF("\nTurboVNC security and authentication options\n");
+diff --git a/unix/Xvnc/programs/Xserver/hw/vnc/rfb.h b/unix/Xvnc/programs/Xserver/hw/vnc/rfb.h
+index baec688..2047083 100644
+--- a/unix/Xvnc/programs/Xserver/hw/vnc/rfb.h
++++ b/unix/Xvnc/programs/Xserver/hw/vnc/rfb.h
+@@ -87,7 +87,7 @@
+ 
+ /* Maximum number of threads to use for multithreaded encoding, regardless of
+    the CPU count */
+-#define MAX_ENCODING_THREADS 4
++#define MAX_ENCODING_THREADS 32
+ 
+ /* Maximum number of client connections.  The default of 100 should be more
+    than enough for most use cases.  The ceiling is set to 500 to give us plenty
+@@ -416,6 +416,7 @@ typedef struct rfbClientRec {
+ 
+   /* tight encoding -- preserve zlib streams' state for each client */
+ 
++  unsigned int generation;          /* monotonic client-identity token */
+   z_stream zsStruct[4];
+   Bool zsActive[4];
+   int zsLevel[4];
+diff --git a/unix/Xvnc/programs/Xserver/hw/vnc/rfbserver.c b/unix/Xvnc/programs/Xserver/hw/vnc/rfbserver.c
+index a3a3f17..cd021ee 100644
+--- a/unix/Xvnc/programs/Xserver/hw/vnc/rfbserver.c
++++ b/unix/Xvnc/programs/Xserver/hw/vnc/rfbserver.c
+@@ -93,6 +93,7 @@ Bool rfbMT = TRUE;
+ Bool rfbMT = FALSE;
+ #endif
+ int rfbNumThreads = 0;
++unsigned int rfbClientGeneration = 0;  /* bumped per new client */
+ 
+ static rfbClientPtr rfbNewClient(int sock);
+ static void rfbProcessClientProtocolVersion(rfbClientPtr cl);
+@@ -404,6 +405,7 @@ static rfbClientPtr rfbNewClient(int sock)
+   cl->host = strdup(sockaddr_string(&addr, addrStr, INET6_ADDRSTRLEN));
+   cl->id = rfbClientNumber++;
+   if (rfbClientNumber == 0) rfbClientNumber = 1;
++  cl->generation = ++rfbClientGeneration;
+ 
+   RFBLOGID("Got connection from %s on port %d\n", cl->host,
+            ntohs(addr.u.sin.sin_port));
+@@ -530,7 +532,7 @@ static rfbClientPtr rfbNewClient(int sock)
+     rfbMT = FALSE;
+   }
+   if (!rfbMT) rfbNumThreads = 1;
+-  else if (rfbNumThreads < 1) rfbNumThreads = min(np, 4);
++  else if (rfbNumThreads < 1) rfbNumThreads = min(np, MAX_ENCODING_THREADS);
+   if (rfbNumThreads > np) {
+     rfbLog("NOTICE: Encoding thread count has been clamped to CPU count\n");
+     rfbNumThreads = np;
+diff --git a/unix/Xvnc/programs/Xserver/hw/vnc/tight.c b/unix/Xvnc/programs/Xserver/hw/vnc/tight.c
+index 46b5ee8..0deb155 100644
+--- a/unix/Xvnc/programs/Xserver/hw/vnc/tight.c
++++ b/unix/Xvnc/programs/Xserver/hw/vnc/tight.c
+@@ -128,7 +128,7 @@ typedef struct PALETTE_s {
+ /* Globals for multi-threading */
+ 
+ static Bool threadInit = FALSE;
+-static pthread_t thnd[MAX_ENCODING_THREADS] = { 0, 0, 0, 0 };
++static pthread_t thnd[MAX_ENCODING_THREADS] = { 0 };
+ 
+ typedef struct _threadparam {
+   rfbClientPtr cl;
+@@ -145,6 +145,12 @@ typedef struct _threadparam {
+   tjhandle j;
+   int bytessent, rectsent;
+   int streamId, baseStreamId, nStreams;
++  /* per-thread zlib state -> nt>4 path. each thread deflates own zs[] only. */
++  z_stream zs[4];
++  Bool zsActive[4];
++  int zsLevel[4];
++  Bool resetStream[4];     /* next subrect on wire id k must carry reset bit */
++  unsigned int clientGen;  /* generation of client these zs belong to */
+   pthread_mutex_t ready, done;
+   Bool status, deadyet;
+   RegionRec lossyRegion, losslessRegion;
+@@ -292,6 +298,7 @@ static void InitThreads(void)
+   if (threadInit) return;
+ 
+   memset(tparam, 0, sizeof(threadparam) * MAX_ENCODING_THREADS);
++  /* zs[] left zeroed -> lazy deflateInit2 in CompressData on first use. */
+   tparam[0].ublen = &ublen;
+   tparam[0].updateBuf = updateBuf;
+   for (i = 1; i < MAX_ENCODING_THREADS; i++) {
+@@ -339,10 +346,18 @@ void ShutdownTightThreads(void)
+     }
+   }
+   for (i = 0; i < rfbNumThreads; i++) {
++    int k;
+     free(tparam[i].tightAfterBuf);
+     free(tparam[i].tightBeforeBuf);
+     if (i != 0) free(tparam[i].updateBuf);
+     if (tparam[i].j) tjDestroy(tparam[i].j);
++    /* deflateEnd active per-thread streams before memset -> no zlib heap leak */
++    for (k = 0; k < 4; k++) {
++      if (tparam[i].zsActive[k]) {
++        deflateEnd(&tparam[i].zs[k]);
++        tparam[i].zsActive[k] = FALSE;
++      }
++    }
+     if (!REGION_NAR(&tparam[i].losslessRegion))
+       REGION_UNINIT(pScreen, &tparam[i].losslessRegion);
+     if (!REGION_NAR(&tparam[i].lossyRegion))
+@@ -406,6 +421,7 @@ Bool rfbSendRectEncodingTight(rfbClientPtr cl, int x, int y, int w, int h)
+     usePixelFormat24 = FALSE;
+ 
+   nt = min(rfbNumThreads, w * h / MAXRECTSIZE);
++  nt = min(nt, h);                    /* never a 0-height strip */
+   if (nt < 1) nt = 1;
+ 
+   for (i = 0; i < nt; i++) {
+@@ -420,18 +436,29 @@ Bool rfbSendRectEncodingTight(rfbClientPtr cl, int x, int y, int w, int h)
+       REGION_INIT(pScreen, &tparam[i].lossyRegion, NullBox, 0);
+       REGION_INIT(pScreen, &tparam[i].losslessRegion, NullBox, 0);
+     }
+-    /* Tight encoding has only a limited number of zlib streams (4).  The
+-       streams must all be left open as long as the client is connected, or
+-       performance suffers.  Thus, multiple threads can't use the same zlib
+-       stream.  We divide the pool of 4 evenly among the available threads (up
+-       to the first 4 threads), and if each thread has more than one stream, it
+-       cycles between them in a round-robin fashion. */
+-    if (i < 4) {
+-      int n = min(nt, 4);
+-      tparam[i].baseStreamId = 4 / n * i;
+-      if (i == n - 1) tparam[i].nStreams = 4 - tparam[i].baseStreamId;
+-      else tparam[i].nStreams = 4 / n;
+-      tparam[i].streamId = tparam[i].baseStreamId;
++    tparam[i].resetStream[0] = tparam[i].resetStream[1] =
++      tparam[i].resetStream[2] = tparam[i].resetStream[3] = FALSE;
++    /* Tight has only 4 wire zlib stream ids (0..3).  nt<=4: divide the 4 ids
++       disjointly, streams persist cross-frame, no resets -> wire output
++       byte-identical to stock.  nt>4: pin thread i to wire id i%4, deflate
++       through its own t->zs, reset that id before the thread's first zlib
++       subrect so the client realigns its inflate context. */
++    if (nt <= 4) {
++      if (i < 4) {
++        int n = min(nt, 4);
++        tparam[i].baseStreamId = 4 / n * i;
++        if (i == n - 1) tparam[i].nStreams = 4 - tparam[i].baseStreamId;
++        else tparam[i].nStreams = 4 / n;
++        tparam[i].streamId = tparam[i].baseStreamId;
++      }
++    } else {
++      int wireId = i % 4;
++      tparam[i].baseStreamId = wireId;       /* single wire id */
++      tparam[i].nStreams = 0;                /* no round-robin */
++      tparam[i].streamId = wireId;
++      /* >4 threads share 4 wire ids -> every strip resets its stream each
++         frame so client inflater realigns; no cross-frame history kept. */
++      tparam[i].resetStream[wireId] = TRUE;
+     }
+   }
+   if (nt > 1) {
+@@ -975,7 +1002,9 @@ static Bool SendMonoRect(threadparam *t, int w, int h)
+     t->updateBuf[(*t->ublen)++] =
+       (char)((rfbTightNoZlib | rfbTightExplicitFilter) << 4);
+   else
+-    t->updateBuf[(*t->ublen)++] = (streamId | rfbTightExplicitFilter) << 4;
++    t->updateBuf[(*t->ublen)++] =
++      (char)(((streamId | rfbTightExplicitFilter) << 4) |
++             (t->resetStream[streamId] ? (1 << streamId) : 0));
+   t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
+   t->updateBuf[(*t->ublen)++] = 1;
+ 
+@@ -1043,7 +1072,9 @@ static Bool SendIndexedRect(threadparam *t, int w, int h)
+     t->updateBuf[(*t->ublen)++] =
+       (char)((rfbTightNoZlib | rfbTightExplicitFilter) << 4);
+   else
+-    t->updateBuf[(*t->ublen)++] = (streamId | rfbTightExplicitFilter) << 4;
++    t->updateBuf[(*t->ublen)++] =
++      (char)(((streamId | rfbTightExplicitFilter) << 4) |
++             (t->resetStream[streamId] ? (1 << streamId) : 0));
+   t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
+   t->updateBuf[(*t->ublen)++] = (char)(t->paletteNumColors - 1);
+ 
+@@ -1108,7 +1139,9 @@ static Bool SendFullColorRect(threadparam *t, int w, int h)
+   if (tightConf[compressLevel].rawZlibLevel == 0 && cl->enableTightWithoutZlib)
+     t->updateBuf[(*t->ublen)++] = (char)(rfbTightNoZlib << 4);
+   else
+-    t->updateBuf[(*t->ublen)++] = streamId << 4;
++    t->updateBuf[(*t->ublen)++] =
++      (char)((streamId << 4) |
++             (t->resetStream[streamId] ? (1 << streamId) : 0));
+   t->bytessent++;
+ 
+   if (usePixelFormat24) {
+@@ -1140,10 +1173,23 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
+   if (zlibLevel == 0 && cl->enableTightWithoutZlib)
+     return SendCompressedData(t, t->tightBeforeBuf, dataLen);
+ 
+-  pz = &cl->zsStruct[streamId];
++  /* tparam[] is process-global -> a thread's zs may carry a prior client's
++     deflate history.  on client change, end every active stream. */
++  if (t->clientGen != cl->generation) {
++    int s;
++    for (s = 0; s < 4; s++) {
++      if (t->zsActive[s]) {
++        deflateEnd(&t->zs[s]);
++        t->zsActive[s] = FALSE;
++      }
++    }
++    t->clientGen = cl->generation;
++  }
++
++  pz = &t->zs[streamId];
+ 
+   /* Initialize compression stream if needed. */
+-  if (!cl->zsActive[streamId]) {
++  if (!t->zsActive[streamId]) {
+     pz->zalloc = Z_NULL;
+     pz->zfree = Z_NULL;
+     pz->opaque = Z_NULL;
+@@ -1153,8 +1199,13 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
+     if (err != Z_OK)
+       return FALSE;
+ 
+-    cl->zsActive[streamId] = TRUE;
+-    cl->zsLevel[streamId] = zlibLevel;
++    t->zsActive[streamId] = TRUE;
++    t->zsLevel[streamId] = zlibLevel;
++  } else if (t->resetStream[streamId]) {
++    /* shared wire id -> restart server deflate history to match the
++       inflateReset the client does on the reset bit. */
++    if (deflateReset(pz) != Z_OK)
++      return FALSE;
+   }
+ 
+   /* Prepare buffer pointers. */
+@@ -1164,10 +1215,10 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
+   pz->avail_out = t->tightAfterBufSize;
+ 
+   /* Change compression parameters if needed. */
+-  if (zlibLevel != cl->zsLevel[streamId]) {
++  if (zlibLevel != t->zsLevel[streamId]) {
+     if (deflateParams(pz, zlibLevel, zlibStrategy) != Z_OK)
+       return FALSE;
+-    cl->zsLevel[streamId] = zlibLevel;
++    t->zsLevel[streamId] = zlibLevel;
+   }
+ 
+   /* Actual compression. */
+@@ -1175,6 +1226,10 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
+       pz->avail_out == 0)
+     return FALSE;
+ 
++  /* reset bit emitted in caller's control byte; fresh deflateInit2 above
++     realigned server+client streams -> clear so later subrects don't re-reset */
++  t->resetStream[streamId] = FALSE;
++
+   return SendCompressedData(t, t->tightAfterBuf,
+                             t->tightAfterBufSize - pz->avail_out);
+ }

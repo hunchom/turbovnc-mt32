@@ -1,0 +1,13 @@
+diff --git a/java/com/turbovnc/rfb/TightDecoder.java b/java/com/turbovnc/rfb/TightDecoder.java
+index ea66191..6f10a41 100644
+--- a/java/com/turbovnc/rfb/TightDecoder.java
++++ b/java/com/turbovnc/rfb/TightDecoder.java
+@@ -141,7 +141,7 @@ public class TightDecoder extends Decoder {
+     // Flush zlib streams if we are told by the server to do so.
+     for (int i = 0; i < 4; i++) {
+       if ((compCtl & 1) != 0)
+-        inflater[i].end();
++        inflater[i].reset();
+       compCtl >>= 1;
+     }
+ 

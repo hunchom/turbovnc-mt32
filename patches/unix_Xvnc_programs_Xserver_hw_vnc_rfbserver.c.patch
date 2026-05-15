@@ -1,0 +1,29 @@
+diff --git a/unix/Xvnc/programs/Xserver/hw/vnc/rfbserver.c b/unix/Xvnc/programs/Xserver/hw/vnc/rfbserver.c
+index a3a3f17..cd021ee 100644
+--- a/unix/Xvnc/programs/Xserver/hw/vnc/rfbserver.c
++++ b/unix/Xvnc/programs/Xserver/hw/vnc/rfbserver.c
+@@ -93,6 +93,7 @@ Bool rfbMT = TRUE;
+ Bool rfbMT = FALSE;
+ #endif
+ int rfbNumThreads = 0;
++unsigned int rfbClientGeneration = 0;  /* bumped per new client */
+ 
+ static rfbClientPtr rfbNewClient(int sock);
+ static void rfbProcessClientProtocolVersion(rfbClientPtr cl);
+@@ -404,6 +405,7 @@ static rfbClientPtr rfbNewClient(int sock)
+   cl->host = strdup(sockaddr_string(&addr, addrStr, INET6_ADDRSTRLEN));
+   cl->id = rfbClientNumber++;
+   if (rfbClientNumber == 0) rfbClientNumber = 1;
++  cl->generation = ++rfbClientGeneration;
+ 
+   RFBLOGID("Got connection from %s on port %d\n", cl->host,
+            ntohs(addr.u.sin.sin_port));
+@@ -530,7 +532,7 @@ static rfbClientPtr rfbNewClient(int sock)
+     rfbMT = FALSE;
+   }
+   if (!rfbMT) rfbNumThreads = 1;
+-  else if (rfbNumThreads < 1) rfbNumThreads = min(np, 4);
++  else if (rfbNumThreads < 1) rfbNumThreads = min(np, MAX_ENCODING_THREADS);
+   if (rfbNumThreads > np) {
+     rfbLog("NOTICE: Encoding thread count has been clamped to CPU count\n");
+     rfbNumThreads = np;

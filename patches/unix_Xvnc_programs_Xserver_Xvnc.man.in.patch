@@ -1,0 +1,19 @@
+diff --git a/unix/Xvnc/programs/Xserver/Xvnc.man.in b/unix/Xvnc/programs/Xserver/Xvnc.man.in
+index 8dcd290..3052980 100644
+--- a/unix/Xvnc/programs/Xserver/Xvnc.man.in
++++ b/unix/Xvnc/programs/Xserver/Xvnc.man.in
+@@ -373,10 +373,10 @@ Disable multithreaded Tight encoding
+ .TP
+ \fB\-nthreads\fR \fIthread-count\fR
+ Specify the number of threads to use with multithreaded Tight encoding.  The
+-default is to use one thread per CPU core, up to a maximum of 4 (because using
+-more than 4 encoding threads breaks compatibility with viewers other than the
+-TurboVNC Viewer.)  The server will not allow the thread count to exceed 4, nor
+-to exceed the number of CPU cores.
++default is to use one thread per CPU core, up to a maximum of 32.  The server
++will not allow the thread count to exceed 32, nor to exceed the number of CPU
++cores.  Using more than 4 encoding threads requires the TurboVNC Viewer; other
++viewers support a maximum of 4 Tight zlib streams.
+ 
+ .TP
+ \fBTURBOVNC SECURITY AND AUTHENTICATION OPTIONS\fR

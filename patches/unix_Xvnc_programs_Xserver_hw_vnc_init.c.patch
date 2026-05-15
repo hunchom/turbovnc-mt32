@@ -1,0 +1,13 @@
+diff --git a/unix/Xvnc/programs/Xserver/hw/vnc/init.c b/unix/Xvnc/programs/Xserver/hw/vnc/init.c
+index c42e7ce..6651f07 100644
+--- a/unix/Xvnc/programs/Xserver/hw/vnc/init.c
++++ b/unix/Xvnc/programs/Xserver/hw/vnc/init.c
+@@ -1897,7 +1897,7 @@ void ddxUseMsg(void)
+   ErrorF("-nthreads N            specify number of threads (1 <= N <= %d) to use with\n",
+          MAX_ENCODING_THREADS);
+   ErrorF("                       multithreaded Tight encoding [default: 1 per CPU core,\n");
+-  ErrorF("                       max. 4]\n");
++  ErrorF("                       max. %d]\n", MAX_ENCODING_THREADS);
+ #endif
+ 
+   ErrorF("\nTurboVNC security and authentication options\n");
