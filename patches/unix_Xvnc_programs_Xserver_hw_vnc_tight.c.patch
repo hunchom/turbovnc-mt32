@@ -1,5 +1,5 @@
 diff --git a/unix/Xvnc/programs/Xserver/hw/vnc/tight.c b/unix/Xvnc/programs/Xserver/hw/vnc/tight.c
-index 46b5ee8..1c257d8 100644
+index 46b5ee8..b60f6e5 100644
 --- a/unix/Xvnc/programs/Xserver/hw/vnc/tight.c
 +++ b/unix/Xvnc/programs/Xserver/hw/vnc/tight.c
 @@ -128,7 +128,10 @@ typedef struct PALETTE_s {
@@ -126,7 +126,40 @@ index 46b5ee8..1c257d8 100644
      }
    }
    if (nt > 1) {
-@@ -975,7 +1016,10 @@ static Bool SendMonoRect(threadparam *t, int w, int h)
+@@ -445,22 +486,26 @@ Bool rfbSendRectEncodingTight(rfbClientPtr cl, int x, int y, int w, int h)
+   cl->rfbRectanglesSent[rfbEncodingTight] += tparam[0].rectsent;
+ 
+   if (nt > 1) {
+-    for (i = 1; i < nt; i++) {
+-      pthread_mutex_lock(&tparam[i].done);
+-      status &= tparam[i].status;
+-    }
+-    if (status == FALSE) return FALSE;
++    /* Pipeline output with encoding: flush thread 0's buffer now, then write
++       each worker's buffer the instant that worker finishes, so socket I/O
++       overlaps the still-encoding higher-numbered threads instead of running
++       serially after all of them.  Every worker is still joined before
++       return; a write failure tears the client down (ShutdownTightThreads
++       joins all workers) and returns immediately. */
+     if (ublen > 0) {
+       if (!rfbSendUpdateBuf(cl))
+         return FALSE;
+     }
+     for (i = 1; i < nt; i++) {
+-      if ((*tparam[i].ublen) > 0)
++      pthread_mutex_lock(&tparam[i].done);
++      status &= tparam[i].status;
++      if (status && (*tparam[i].ublen) > 0)
+         WRITE_OR_CLOSE(tparam[i].updateBuf, *tparam[i].ublen, return FALSE);
+       (*tparam[i].ublen) = 0;
+       cl->rfbBytesSent[rfbEncodingTight] += tparam[i].bytessent;
+       cl->rfbRectanglesSent[rfbEncodingTight] += tparam[i].rectsent;
+     }
++    if (status == FALSE) return FALSE;
+   }
+ 
+   if (rfbAutoLosslessRefresh > 0.0) {
+@@ -975,7 +1020,10 @@ static Bool SendMonoRect(threadparam *t, int w, int h)
      t->updateBuf[(*t->ublen)++] =
        (char)((rfbTightNoZlib | rfbTightExplicitFilter) << 4);
    else
@@ -138,7 +171,7 @@ index 46b5ee8..1c257d8 100644
    t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
    t->updateBuf[(*t->ublen)++] = 1;
  
-@@ -1043,7 +1087,10 @@ static Bool SendIndexedRect(threadparam *t, int w, int h)
+@@ -1043,7 +1091,10 @@ static Bool SendIndexedRect(threadparam *t, int w, int h)
      t->updateBuf[(*t->ublen)++] =
        (char)((rfbTightNoZlib | rfbTightExplicitFilter) << 4);
    else
@@ -150,7 +183,7 @@ index 46b5ee8..1c257d8 100644
    t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
    t->updateBuf[(*t->ublen)++] = (char)(t->paletteNumColors - 1);
  
-@@ -1108,7 +1155,10 @@ static Bool SendFullColorRect(threadparam *t, int w, int h)
+@@ -1108,7 +1159,10 @@ static Bool SendFullColorRect(threadparam *t, int w, int h)
    if (tightConf[compressLevel].rawZlibLevel == 0 && cl->enableTightWithoutZlib)
      t->updateBuf[(*t->ublen)++] = (char)(rfbTightNoZlib << 4);
    else
@@ -162,7 +195,7 @@ index 46b5ee8..1c257d8 100644
    t->bytessent++;
  
    if (usePixelFormat24) {
-@@ -1140,10 +1190,10 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
+@@ -1140,10 +1194,10 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
    if (zlibLevel == 0 && cl->enableTightWithoutZlib)
      return SendCompressedData(t, t->tightBeforeBuf, dataLen);
  
@@ -175,7 +208,7 @@ index 46b5ee8..1c257d8 100644
      pz->zalloc = Z_NULL;
      pz->zfree = Z_NULL;
      pz->opaque = Z_NULL;
-@@ -1153,8 +1203,13 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
+@@ -1153,8 +1207,13 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
      if (err != Z_OK)
        return FALSE;
  
@@ -191,7 +224,7 @@ index 46b5ee8..1c257d8 100644
    }
  
    /* Prepare buffer pointers. */
-@@ -1164,10 +1219,10 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
+@@ -1164,10 +1223,10 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
    pz->avail_out = t->tightAfterBufSize;
  
    /* Change compression parameters if needed. */
@@ -204,7 +237,7 @@ index 46b5ee8..1c257d8 100644
    }
  
    /* Actual compression. */
-@@ -1175,6 +1230,10 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
+@@ -1175,6 +1234,10 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
        pz->avail_out == 0)
      return FALSE;
  

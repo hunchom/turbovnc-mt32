@@ -486,22 +486,26 @@ Bool rfbSendRectEncodingTight(rfbClientPtr cl, int x, int y, int w, int h)
   cl->rfbRectanglesSent[rfbEncodingTight] += tparam[0].rectsent;
 
   if (nt > 1) {
-    for (i = 1; i < nt; i++) {
-      pthread_mutex_lock(&tparam[i].done);
-      status &= tparam[i].status;
-    }
-    if (status == FALSE) return FALSE;
+    /* Pipeline output with encoding: flush thread 0's buffer now, then write
+       each worker's buffer the instant that worker finishes, so socket I/O
+       overlaps the still-encoding higher-numbered threads instead of running
+       serially after all of them.  Every worker is still joined before
+       return; a write failure tears the client down (ShutdownTightThreads
+       joins all workers) and returns immediately. */
     if (ublen > 0) {
       if (!rfbSendUpdateBuf(cl))
         return FALSE;
     }
     for (i = 1; i < nt; i++) {
-      if ((*tparam[i].ublen) > 0)
+      pthread_mutex_lock(&tparam[i].done);
+      status &= tparam[i].status;
+      if (status && (*tparam[i].ublen) > 0)
         WRITE_OR_CLOSE(tparam[i].updateBuf, *tparam[i].ublen, return FALSE);
       (*tparam[i].ublen) = 0;
       cl->rfbBytesSent[rfbEncodingTight] += tparam[i].bytessent;
       cl->rfbRectanglesSent[rfbEncodingTight] += tparam[i].rectsent;
     }
+    if (status == FALSE) return FALSE;
   }
 
   if (rfbAutoLosslessRefresh > 0.0) {

@@ -23,7 +23,8 @@ Built and run on Rocky 8 / RHEL 8 (`Xvnc 3.3.1.mt32`):
 - **9-minute hard-transition stress, 2 simultaneous clients**, 62k+ rectangles — **0 decode errors**
 - **AddressSanitizer** clean under real-32-thread load (no corruption / leak / UAF)
 - Clean across `-nthreads` 1/2/4/8/16/32, client reconnects, and tiny windows
-- Benchmark: **3.15× faster** full-screen encode at 4 threads (8-core VM)
+- Benchmark: **3.4× faster** full-screen encode at 4 threads (8-core VM)
+- Pipelined socket I/O — transmission overlaps encoding (correctness-neutral)
 
 ## Contents
 
@@ -49,6 +50,6 @@ Then build the RPM and set `$serverArgs = "-nthreads 32";` in
 
 ## Files changed
 
-7 files, ~90 lines: `rfb.h`, `tight.c`, `rfbserver.c`, `init.c`,
+7 files, ~105 lines: `rfb.h`, `tight.c`, `rfbserver.c`, `init.c`,
 `Xvnc.man.in`, `CMakeLists.txt`, and `TightDecoder.java` (a required
 one-line viewer fix).

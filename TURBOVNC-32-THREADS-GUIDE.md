@@ -465,6 +465,56 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
 }
 ```
 
+**L — pipeline socket I/O with encoding (perf), in `rfbSendRectEncodingTight`
+(line ~488).** Stock joins *all* workers, then writes *all* buffers serially.
+This writes each worker's buffer the moment that worker finishes, so
+transmission overlaps the still-encoding higher-numbered threads:
+
+```c
+/* BEFORE */
+  if (nt > 1) {
+    for (i = 1; i < nt; i++) {
+      pthread_mutex_lock(&tparam[i].done);
+      status &= tparam[i].status;
+    }
+    if (status == FALSE) return FALSE;
+    if (ublen > 0) {
+      if (!rfbSendUpdateBuf(cl))
+        return FALSE;
+    }
+    for (i = 1; i < nt; i++) {
+      if ((*tparam[i].ublen) > 0)
+        WRITE_OR_CLOSE(tparam[i].updateBuf, *tparam[i].ublen, return FALSE);
+      (*tparam[i].ublen) = 0;
+      cl->rfbBytesSent[rfbEncodingTight] += tparam[i].bytessent;
+      cl->rfbRectanglesSent[rfbEncodingTight] += tparam[i].rectsent;
+    }
+  }
+/* AFTER */
+  if (nt > 1) {
+    /* Pipeline output with encoding: flush thread 0's buffer now, then write
+       each worker's buffer the instant that worker finishes, so socket I/O
+       overlaps the still-encoding higher-numbered threads instead of running
+       serially after all of them.  Every worker is still joined before
+       return; a write failure tears the client down (ShutdownTightThreads
+       joins all workers) and returns immediately. */
+    if (ublen > 0) {
+      if (!rfbSendUpdateBuf(cl))
+        return FALSE;
+    }
+    for (i = 1; i < nt; i++) {
+      pthread_mutex_lock(&tparam[i].done);
+      status &= tparam[i].status;
+      if (status && (*tparam[i].ublen) > 0)
+        WRITE_OR_CLOSE(tparam[i].updateBuf, *tparam[i].ublen, return FALSE);
+      (*tparam[i].ublen) = 0;
+      cl->rfbBytesSent[rfbEncodingTight] += tparam[i].bytessent;
+      cl->rfbRectanglesSent[rfbEncodingTight] += tparam[i].rectsent;
+    }
+    if (status == FALSE) return FALSE;
+  }
+```
+
 ---
 
 ### 3.4 `unix/Xvnc/programs/Xserver/hw/vnc/init.c` — help text (line ~1900)
@@ -612,6 +662,7 @@ Built and run on Rocky 8 (Xvnc `3.3.1.mt32`):
 | `-nthreads` 1 / 2 / 4 / 8 / 16 / 32 | all decode clean |
 | Client disconnect + reconnect | clean (client-generation guard) |
 | Tiny window 240×6, `-nthreads 32` | no crash, no SIGFPE (zero-height-strip guard) |
+| Pipelined-I/O build: 200 s transition stress + ASan | **0 decode errors, 0 ASan errors** |
 
 The transition stress (mixed big + small updates, the workload that exposes
 zlib-stream desync) is the key test — it caught two earlier incomplete fixes
@@ -619,21 +670,41 @@ before the final sticky-reset design passed it cleanly.
 
 ### Benchmark
 
-Encode time per frame, full-screen incompressible updates (worst case),
-8-core Rocky 8 VM:
+Encode time per frame, full-screen incompressible random updates (worst case
+for the encoder), 8-core Rocky 8 VM, final build:
 
 | threads | encode/frame | speedup vs 1 |
 |---------|--------------|--------------|
-| 1 | 44.0 ms | 1.00× |
-| 2 | 22.4 ms | 1.96× |
-| 4 | 14.0 ms | 3.15× |
-| 8 | 15.0 ms | 2.94× |
-| 16 | 12.3 ms | 3.57× |
-| 32 | 11.4 ms | 3.85× |
+| 1 | 43.6 ms | 1.00× |
+| 2 | 22.8 ms | 1.91× |
+| 4 | 12.9 ms | 3.39× |
+| 8 | 12.5 ms | 3.49× |
 
-Near-linear scaling to 4 threads; it flattens past the VM's 8-core budget
-(the benchmark's screen-blitter and the viewer also consume cores). 32 threads
-on 8 cores still gave the best result with **no contention regression**. On an
-80-core box with GPU-side VirtualGL rendering there is far more CPU headroom,
-so the scaling extends further — benchmark `-nthreads` 4 / 8 / 16 / 32 on your
-real workload (`TVNC_PROFILE=1` logs encoder throughput) to find your knee.
+Near-linear scaling to 4 threads; it flattens past the VM's usable core budget
+(the benchmark's screen-blitter and the Java viewer also consume cores, so only
+~4–5 of the 8 cores are free for encode workers). Earlier runs confirmed 16 and
+32 threads on the same 8-core VM still improve slightly (~3.8×) with **no
+contention regression** — oversubscription does not hurt. On an 80-core box with
+GPU-side VirtualGL rendering there is far more CPU headroom, so the scaling
+extends much further. Benchmark `-nthreads` 4 / 8 / 16 / 32 on your real
+workload (`TVNC_PROFILE=1` logs encoder throughput) to find your knee.
+
+### Performance work in this patch
+
+- **Threaded encode** — the core speedup: 3.4× at 4 threads above.
+- **Dynamic per-frame scaling** — `nt` is chosen per frame from rectangle
+  area, so small updates never pay thread-dispatch overhead (no contention).
+- **Pipelined output (change L)** — stock encodes *all* strips, then transmits
+  *all* of them serially. This patch transmits each worker's strip the instant
+  it finishes, overlapping transmission with the still-encoding threads. On the
+  loopback test this is within noise (loopback is not bandwidth-bound, so the
+  write was never on the critical path); the benefit scales with how
+  bandwidth-constrained the real client link is. It is correctness-neutral and
+  cannot regress.
+
+Considered and **not** done (would help but carry rearchitecture risk against
+the "must not break" requirement): content-aware strip sizing (equal-height
+strips ≠ equal-cost — a video region costs more than static UI); a work-stealing
+queue across multiple damage rectangles; NUMA thread/framebuffer affinity on
+multi-socket hosts. These are the next avenues if more speed is needed and a
+larger change is acceptable.
