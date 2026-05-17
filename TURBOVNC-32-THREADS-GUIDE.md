@@ -6,49 +6,55 @@ multithreaded Tight encoder support up to **32** threads (was hard-capped at
 
 - **Base:** TurboVNC `3.3.1` (`github.com/TurboVNC/turbovnc`)
 - **Files changed:** 7 (6 server/build, 1 viewer)
-- **Lines:** ~90 changed
+- **Lines:** ~95 changed
 - **Tested:** builds clean on Rocky 8 / RHEL 8; ran at a real **32 threads**
-  (`2560x1440`, 46k+ Tight rectangles, 936 frames) — **0 decode errors**,
-  **0 AddressSanitizer errors**, clean across client reconnects and tiny
-  windows.
+  (198k+ Tight rectangles) and through a **9-minute hard-transition stress
+  with 2 simultaneous clients** — **0 decode errors**, **0 AddressSanitizer
+  errors**. Benchmark: **3.15× faster** full-screen encode at 4 threads.
 
 ---
 
-## 1. Why the limit was 4 (read this first)
+## 1. Why the limit was 4, and how this lifts it
 
-The Tight wire protocol defines exactly **4 zlib stream IDs**. The stock
-server keeps 4 shared `z_stream`s per client and hands each encoder thread a
-disjoint subset — so with >4 threads, multiple threads would `deflate()` the
-**same** `z_stream` concurrently → heap corruption → segfault.
+The Tight wire protocol defines exactly **4 zlib stream IDs**. Stock TurboVNC
+keeps 4 shared `z_stream`s per client and hands each encoder thread a disjoint
+subset — so with >4 threads, multiple threads would `deflate()` the **same**
+`z_stream` concurrently → heap corruption → segfault. The `4` guards that.
 
-This patch fixes that properly:
+This patch:
 
-- Each thread gets its **own** 4 `z_stream`s (`threadparam.zs[4]`) → no two
-  threads ever touch one `z_stream`.
-- The 4 wire IDs are reused round-robin (`wireId = i % 4`); every thread
-  **resets** its wire stream at the start of its strip each frame, so the
-  client's zlib decoder re-aligns at every thread boundary.
-- `nt <= 4` behaves **byte-identically to stock** — all new risk is confined
-  to the `nt > 4` path.
-- The viewer has a latent bug (`Inflater.end()` instead of `.reset()`) that is
-  dead code in stock but fatal once the server emits reset bits — fixed here
-  (1 line).
+1. **Per-thread zlib contexts.** Each thread gets its own 4 `z_stream`s
+   (`threadparam.zs[4]`). No two threads ever touch one `z_stream` → race-free
+   by construction.
+2. **Wire-ID reuse with a reset handshake.** The 4 wire IDs are reused
+   (`wireId = i % 4`). A wire zlib stream stays *continuous* across frames only
+   while the **same thread** keeps writing it. Whenever that breaks, the server
+   restarts the stream (`deflateReset`) and sets a reset bit in the Tight
+   control byte so the client reinitializes its matching inflater.
+3. **Sticky reset tracking.** `resetStream[k]` is set when continuity breaks
+   and stays set until the reset is actually emitted — so a thread that owns a
+   wire ID but skips it for some frames (empty strip) still resets correctly on
+   its next use. The reset bit fires exactly when the server (re)starts a
+   stream: `!zsActive || resetStream`.
+4. **Continuity is broken** (→ reset) when: more than 4 threads run (wire IDs
+   shared); OR the thread count changed between frames (thread↔ID mapping
+   shifted); OR a different client encoded last.
+5. **Viewer fix.** The viewer had a latent bug (`Inflater.end()` instead of
+   `.reset()`) — dead code in stock, fatal once the server emits reset bits.
+   Fixed (1 line).
 
-**Trade-off:** with `nt > 4`, cross-*frame* zlib history is dropped (each
-strip is recompressed fresh each frame). Negligible for motion/3D content;
-irrelevant in practice because static content produces small rectangles that
-never trigger the `nt > 4` path.
+**Trade-off:** the cross-*frame* zlib history is dropped whenever continuity
+breaks. Negligible for motion/3D content; for steady small updates (constant
+thread count) the streams stay continuous and compression is unaffected.
 
 ---
 
 ## 2. Fast path — apply the patch file
 
-If you have the `turbovnc-mt32.patch` file from this directory:
-
 ```bash
 git clone https://github.com/TurboVNC/turbovnc.git
 cd turbovnc
-git checkout 3.3.1          # match the base version
+git checkout 3.3.1
 git apply /path/to/turbovnc-mt32.patch
 ```
 
@@ -60,26 +66,22 @@ Otherwise apply the 7 files by hand using Section 3.
 
 ### 3.1 `unix/Xvnc/programs/Xserver/hw/vnc/rfb.h`
 
-**Change A — raise the cap (line ~90):**
+**A — raise the cap (line ~90):**
 
 ```c
 /* BEFORE */
 #define MAX_ENCODING_THREADS 4
-```
-```c
 /* AFTER */
 #define MAX_ENCODING_THREADS 32
 ```
 
-**Change B — add a client-generation field to `rfbClientRec` (line ~417):**
+**B — add a client-generation field to `rfbClientRec` (line ~417):**
 
 ```c
 /* BEFORE */
   /* tight encoding -- preserve zlib streams' state for each client */
 
   z_stream zsStruct[4];
-```
-```c
 /* AFTER */
   /* tight encoding -- preserve zlib streams' state for each client */
 
@@ -91,39 +93,33 @@ Otherwise apply the 7 files by hand using Section 3.
 
 ### 3.2 `unix/Xvnc/programs/Xserver/hw/vnc/rfbserver.c`
 
-**Change A — add a global counter (line ~95):**
+**A — global counter (line ~95):**
 
 ```c
 /* BEFORE */
 int rfbNumThreads = 0;
-```
-```c
 /* AFTER */
 int rfbNumThreads = 0;
 unsigned int rfbClientGeneration = 0;  /* bumped per new client */
 ```
 
-**Change B — stamp each new client (in `rfbNewClient`, line ~406):**
+**B — stamp each new client, in `rfbNewClient` (line ~406):**
 
 ```c
 /* BEFORE */
   cl->id = rfbClientNumber++;
   if (rfbClientNumber == 0) rfbClientNumber = 1;
-```
-```c
 /* AFTER */
   cl->id = rfbClientNumber++;
   if (rfbClientNumber == 0) rfbClientNumber = 1;
   cl->generation = ++rfbClientGeneration;
 ```
 
-**Change C — raise the default thread count (line ~533):**
+**C — raise the default thread count (line ~533):**
 
 ```c
 /* BEFORE */
   else if (rfbNumThreads < 1) rfbNumThreads = min(np, 4);
-```
-```c
 /* AFTER */
   else if (rfbNumThreads < 1) rfbNumThreads = min(np, MAX_ENCODING_THREADS);
 ```
@@ -135,51 +131,51 @@ unsigned int rfbClientGeneration = 0;  /* bumped per new client */
 
 ### 3.3 `unix/Xvnc/programs/Xserver/hw/vnc/tight.c`
 
-**Change A — fix the `thnd[]` initializer (line ~131):**
+**A — global continuity trackers + fix `thnd[]` initializer (line ~130):**
 
 ```c
 /* BEFORE */
+static Bool threadInit = FALSE;
 static pthread_t thnd[MAX_ENCODING_THREADS] = { 0, 0, 0, 0 };
-```
-```c
 /* AFTER */
+static Bool threadInit = FALSE;
 static pthread_t thnd[MAX_ENCODING_THREADS] = { 0 };
+/* cross-frame zlib-stream continuity tracking (written single-threaded). */
+static int tightLastNt = 0;
+static unsigned int tightLastClientGen = 0;
 ```
 
-**Change B — add per-thread zlib state to `threadparam` (line ~147):**
+**B — per-thread zlib state in `threadparam` (line ~150):**
 
 ```c
 /* BEFORE */
   int streamId, baseStreamId, nStreams;
   pthread_mutex_t ready, done;
-```
-```c
 /* AFTER */
   int streamId, baseStreamId, nStreams;
   /* per-thread zlib state -> nt>4 path. each thread deflates own zs[] only. */
   z_stream zs[4];
   Bool zsActive[4];
   int zsLevel[4];
-  Bool resetStream[4];     /* next subrect on wire id k must carry reset bit */
-  unsigned int clientGen;  /* generation of client these zs belong to */
+  Bool resetStream[4];     /* this frame: wire id k needs a stream reset */
   pthread_mutex_t ready, done;
 ```
 
-**Change C — comment in `InitThreads` (line ~294):**
+**C — `InitThreads`, reset the trackers (line ~302):**
 
 ```c
 /* BEFORE */
   memset(tparam, 0, sizeof(threadparam) * MAX_ENCODING_THREADS);
   tparam[0].ublen = &ublen;
-```
-```c
 /* AFTER */
   memset(tparam, 0, sizeof(threadparam) * MAX_ENCODING_THREADS);
   /* zs[] left zeroed -> lazy deflateInit2 in CompressData on first use. */
+  tightLastNt = 0;
+  tightLastClientGen = 0;
   tparam[0].ublen = &ublen;
 ```
 
-**Change D — clean up per-thread streams in `ShutdownTightThreads` (line ~341):**
+**D — `ShutdownTightThreads`, free per-thread streams (line ~350):**
 
 ```c
 /* BEFORE */
@@ -189,8 +185,6 @@ static pthread_t thnd[MAX_ENCODING_THREADS] = { 0 };
     if (i != 0) free(tparam[i].updateBuf);
     if (tparam[i].j) tjDestroy(tparam[i].j);
     if (!REGION_NAR(&tparam[i].losslessRegion))
-```
-```c
 /* AFTER */
   for (i = 0; i < rfbNumThreads; i++) {
     int k;
@@ -208,21 +202,43 @@ static pthread_t thnd[MAX_ENCODING_THREADS] = { 0 };
     if (!REGION_NAR(&tparam[i].losslessRegion))
 ```
 
-**Change E — zero-height strip guard (in `rfbSendRectEncodingTight`, line ~408):**
+**E — `rfbSendRectEncodingTight`, add a local (line ~408):**
+
+```c
+/* BEFORE */
+  Bool status = TRUE;
+  int i, nt;
+/* AFTER */
+  Bool status = TRUE, resetAll;
+  int i, nt;
+```
+
+**F — zero-height-strip guard + continuity check (line ~408):**
 
 ```c
 /* BEFORE */
   nt = min(rfbNumThreads, w * h / MAXRECTSIZE);
   if (nt < 1) nt = 1;
-```
-```c
+
+  for (i = 0; i < nt; i++) {
 /* AFTER */
   nt = min(rfbNumThreads, w * h / MAXRECTSIZE);
   nt = min(nt, h);                    /* never a 0-height strip */
   if (nt < 1) nt = 1;
+
+  /* A wire zlib stream stays continuous across frames only while the same
+     thread keeps writing it.  Reset every stream this frame if: >4 threads
+     share the 4 wire ids; OR nt changed (thread<->id mapping shifted); OR a
+     different client encoded last (per-thread zs carry its history). */
+  resetAll = (nt > 4) || (nt != tightLastNt) ||
+             (cl->generation != tightLastClientGen);
+  tightLastNt = nt;
+  tightLastClientGen = cl->generation;
+
+  for (i = 0; i < nt; i++) {
 ```
 
-**Change F — thread-to-stream assignment (line ~423).** Replace the whole
+**G — thread-to-stream assignment (line ~423).** Replace the whole
 `if (i < 4) { ... }` block:
 
 ```c
@@ -240,36 +256,35 @@ static pthread_t thnd[MAX_ENCODING_THREADS] = { 0 };
       else tparam[i].nStreams = 4 / n;
       tparam[i].streamId = tparam[i].baseStreamId;
     }
-```
-```c
 /* AFTER */
-    tparam[i].resetStream[0] = tparam[i].resetStream[1] =
-      tparam[i].resetStream[2] = tparam[i].resetStream[3] = FALSE;
-    /* Tight has only 4 wire zlib stream ids (0..3).  nt<=4: divide the 4 ids
-       disjointly, streams persist cross-frame, no resets -> wire output
-       byte-identical to stock.  nt>4: pin thread i to wire id i%4, deflate
-       through its own t->zs, reset that id before the thread's first zlib
-       subrect so the client realigns its inflate context. */
+    /* Tight has only 4 wire zlib stream ids (0..3).  Assign threads to ids.
+       resetStream[k] is sticky: set here when continuity broke (resetAll),
+       and stays set until the thread actually emits a reset on id k
+       (CompressData clears it).  A thread that owns k but skips it for some
+       frames (empty strip) therefore still resets k on its next use. */
     if (nt <= 4) {
       if (i < 4) {
-        int n = min(nt, 4);
+        int n = min(nt, 4), b;
         tparam[i].baseStreamId = 4 / n * i;
         if (i == n - 1) tparam[i].nStreams = 4 - tparam[i].baseStreamId;
         else tparam[i].nStreams = 4 / n;
         tparam[i].streamId = tparam[i].baseStreamId;
+        if (resetAll)
+          for (b = tparam[i].baseStreamId;
+               b < tparam[i].baseStreamId + tparam[i].nStreams; b++)
+            tparam[i].resetStream[b] = TRUE;
       }
     } else {
       int wireId = i % 4;
       tparam[i].baseStreamId = wireId;       /* single wire id */
       tparam[i].nStreams = 0;                /* no round-robin */
       tparam[i].streamId = wireId;
-      /* >4 threads share 4 wire ids -> every strip resets its stream each
-         frame so client inflater realigns; no cross-frame history kept. */
-      tparam[i].resetStream[wireId] = TRUE;
+      if (resetAll)
+        tparam[i].resetStream[wireId] = TRUE;
     }
 ```
 
-**Change G — control byte in `SendMonoRect` (line ~978):**
+**H — control byte in `SendMonoRect` (line ~978):**
 
 ```c
 /* BEFORE */
@@ -277,18 +292,17 @@ static pthread_t thnd[MAX_ENCODING_THREADS] = { 0 };
     t->updateBuf[(*t->ublen)++] = (streamId | rfbTightExplicitFilter) << 4;
   t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
   t->updateBuf[(*t->ublen)++] = 1;
-```
-```c
 /* AFTER */
   else
     t->updateBuf[(*t->ublen)++] =
       (char)(((streamId | rfbTightExplicitFilter) << 4) |
-             (t->resetStream[streamId] ? (1 << streamId) : 0));
+             ((!t->zsActive[streamId] || t->resetStream[streamId]) ?
+              (1 << streamId) : 0));
   t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
   t->updateBuf[(*t->ublen)++] = 1;
 ```
 
-**Change H — control byte in `SendIndexedRect` (line ~1046):**
+**I — control byte in `SendIndexedRect` (line ~1046):**
 
 ```c
 /* BEFORE */
@@ -296,36 +310,33 @@ static pthread_t thnd[MAX_ENCODING_THREADS] = { 0 };
     t->updateBuf[(*t->ublen)++] = (streamId | rfbTightExplicitFilter) << 4;
   t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
   t->updateBuf[(*t->ublen)++] = (char)(t->paletteNumColors - 1);
-```
-```c
 /* AFTER */
   else
     t->updateBuf[(*t->ublen)++] =
       (char)(((streamId | rfbTightExplicitFilter) << 4) |
-             (t->resetStream[streamId] ? (1 << streamId) : 0));
+             ((!t->zsActive[streamId] || t->resetStream[streamId]) ?
+              (1 << streamId) : 0));
   t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
   t->updateBuf[(*t->ublen)++] = (char)(t->paletteNumColors - 1);
 ```
 
-**Change I — control byte in `SendFullColorRect` (line ~1111):**
+**J — control byte in `SendFullColorRect` (line ~1111):**
 
 ```c
 /* BEFORE */
   else
     t->updateBuf[(*t->ublen)++] = streamId << 4;
   t->bytessent++;
-```
-```c
 /* AFTER */
   else
     t->updateBuf[(*t->ublen)++] =
       (char)((streamId << 4) |
-             (t->resetStream[streamId] ? (1 << streamId) : 0));
+             ((!t->zsActive[streamId] || t->resetStream[streamId]) ?
+              (1 << streamId) : 0));
   t->bytessent++;
 ```
 
-**Change J — `CompressData` (line ~1126).** This function changes in three
-spots. Here is the full function, before and after:
+**K — `CompressData` (line ~1126).** Full function, before and after:
 
 ```c
 /* BEFORE */
@@ -405,19 +416,6 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
   if (zlibLevel == 0 && cl->enableTightWithoutZlib)
     return SendCompressedData(t, t->tightBeforeBuf, dataLen);
 
-  /* tparam[] is process-global -> a thread's zs may carry a prior client's
-     deflate history.  on client change, end every active stream. */
-  if (t->clientGen != cl->generation) {
-    int s;
-    for (s = 0; s < 4; s++) {
-      if (t->zsActive[s]) {
-        deflateEnd(&t->zs[s]);
-        t->zsActive[s] = FALSE;
-      }
-    }
-    t->clientGen = cl->generation;
-  }
-
   pz = &t->zs[streamId];
 
   /* Initialize compression stream if needed. */
@@ -434,8 +432,8 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
     t->zsActive[streamId] = TRUE;
     t->zsLevel[streamId] = zlibLevel;
   } else if (t->resetStream[streamId]) {
-    /* shared wire id -> restart server deflate history to match the
-       inflateReset the client does on the reset bit. */
+    /* continuity broke -> restart deflate history to match the inflateReset
+       the client does on the reset bit emitted in the control byte. */
     if (deflateReset(pz) != Z_OK)
       return FALSE;
   }
@@ -474,8 +472,6 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
 ```c
 /* BEFORE */
   ErrorF("                       max. 4]\n");
-```
-```c
 /* AFTER */
   ErrorF("                       max. %d]\n", MAX_ENCODING_THREADS);
 ```
@@ -491,8 +487,6 @@ default is to use one thread per CPU core, up to a maximum of 4 (because using
 more than 4 encoding threads breaks compatibility with viewers other than the
 TurboVNC Viewer.)  The server will not allow the thread count to exceed 4, nor
 to exceed the number of CPU cores.
-```
-```
 /* AFTER */
 Specify the number of threads to use with multithreaded Tight encoding.  The
 default is to use one thread per CPU core, up to a maximum of 32.  The server
@@ -509,15 +503,12 @@ viewers support a maximum of 4 Tight zlib streams.
 # BEFORE
 set(VERSION 3.3.1)
 set(DOCVERSION 3.3.1)
-```
-```cmake
 # AFTER
 set(VERSION 3.3.1.mt32)
 set(DOCVERSION 3.3.1.mt32)
 ```
 
-> Use a **dot** (`3.3.1.mt32`), not a dash — RPM rejects `-` in a version
-> string. This makes the rebuilt RPM identifiable (`rpm -q turbovnc`).
+> Use a **dot**, not a dash — RPM rejects `-` in a version string.
 
 ---
 
@@ -533,8 +524,6 @@ stream-reset bit.
         inflater[i].end();
       compCtl >>= 1;
     }
-```
-```java
 /* AFTER */
     for (int i = 0; i < 4; i++) {
       if ((compCtl & 1) != 0)
@@ -544,26 +533,24 @@ stream-reset bit.
 ```
 
 > `Inflater.end()` permanently destroys the inflater (next use throws
-> `IllegalStateException`); `.reset()` is the correct flush. The rebuilt RPM
-> ships this viewer, so deploy the rebuilt `VncViewer.jar` wherever you run
-> the viewer.
+> `IllegalStateException`); `.reset()` is the correct flush. Deploy the rebuilt
+> `VncViewer.jar` wherever you run the viewer.
 
 ---
 
 ## 4. Build & install the RPM (RHEL 8 / Rocky 8)
 
 ```bash
-# --- build prerequisites ---
+# build prerequisites
 sudo dnf install -y gcc gcc-c++ make cmake git bison flex rpm-build python3 \
   zlib-devel openssl-devel pam-devel pixman-devel \
   libX11-devel libXext-devel libXfont2-devel libxkbfile-devel \
   libxshmfence-devel libXdmcp-devel libXau-devel libdrm-devel \
   xorg-x11-xtrans-devel xorg-x11-util-macros xorg-x11-proto-devel \
   turbojpeg-devel java-17-openjdk-devel
-# NOTE: turbojpeg-devel provides turbojpeg.h + libturbojpeg.
-#       JDK 17 is required (the bundled viewer needs JDK 16+).
+# turbojpeg-devel provides turbojpeg.h + libturbojpeg.
+# JDK 17 is required (the bundled viewer needs JDK 16+).
 
-# --- configure + build ---
 cd turbovnc                       # the patched source tree
 mkdir build && cd build
 JAVA_HOME=/usr/lib/jvm/java-17 cmake -G"Unix Makefiles" \
@@ -573,23 +560,18 @@ JAVA_HOME=/usr/lib/jvm/java-17 cmake -G"Unix Makefiles" \
   -DJAVA_HOME=/usr/lib/jvm/java-17 ..
 make -j$(nproc)
 
-# --- package + install the RPM (the intended way) ---
-make rpm                          # produces turbovnc-3.3.1.mt32.x86_64.rpm
+make rpm                          # -> turbovnc-3.3.1.mt32.x86_64.rpm
 sudo rpm -Uvh --force turbovnc-3.3.1.mt32.x86_64.rpm
 ```
 
-Verify:
-
-```bash
-/opt/TurboVNC/bin/Xvnc -version     # -> ...(Xvnc) ... v3.3.1.mt32...
-```
+Verify: `/opt/TurboVNC/bin/Xvnc -version` → `...v3.3.1.mt32...`
 
 ---
 
 ## 5. Specifying the thread count in `turbovncserver.conf`
 
-The TurboVNC server config file is `/etc/turbovncserver.conf` (system-wide)
-or `~/.vnc/turbovncserver.conf` (per-user). It is Perl. The variable
+The server config file is `/etc/turbovncserver.conf` (system-wide) or
+`~/.vnc/turbovncserver.conf` (per-user). It is Perl. The variable
 **`$serverArgs`** passes extra arguments straight to `Xvnc`.
 
 Add this line:
@@ -599,35 +581,21 @@ Add this line:
 $serverArgs = "-nthreads 32";
 ```
 
-Then start a session normally:
+Then start a session: `/opt/TurboVNC/bin/vncserver`
 
-```bash
-/opt/TurboVNC/bin/vncserver
-```
-
-### Other ways to set it
+### Other ways
 
 | Method | How |
 |--------|-----|
 | Config file | `$serverArgs = "-nthreads 32";` in `turbovncserver.conf` |
 | Command line | `vncserver -nthreads 32` |
 | Environment | `export TVNC_NTHREADS=32` before `vncserver` |
-| **Do nothing** | Default now auto-scales to `min(CPU cores, 32)` per frame |
+| **Do nothing** | Default auto-scales to `min(CPU cores, 32)` per frame |
 
-Notes:
-- Valid range: `1`–`32`. The server still clamps to your CPU core count.
-- `-nthreads` is a hard ceiling. The encoder picks fewer threads per frame
-  for small screen updates (dynamic scaling) — small updates never spawn 32
-  threads, so there is no contention overhead.
-- On your 80-core box, `-nthreads 32` runs a true 32. Realistic sweet spot is
-  ~8–16; benchmark `-nthreads` 4 / 8 / 16 / 32 on your real workload and pick
-  the knee.
-
-To confirm it took effect, check the session log (`~/.vnc/*.log`):
-
-```
-Using 32 threads for Tight encoding
-```
+- Valid range `1`–`32`; still clamped to your CPU core count.
+- `-nthreads` is a ceiling. The encoder picks fewer threads per frame for
+  small screen updates (dynamic scaling) — no contention on small updates.
+- Confirm via the session log (`~/.vnc/*.log`): `Using N threads for Tight encoding`.
 
 ---
 
@@ -638,12 +606,34 @@ Built and run on Rocky 8 (Xvnc `3.3.1.mt32`):
 | Test | Result |
 |------|--------|
 | Clean Release build (full X server + Java viewer) | pass, 0 warnings in changed files |
-| `-nthreads 32`, real 32 threads, 2560×1440, 40 s motion | "Using 32 threads", 46k+ Tight rects, **0 decode errors** |
-| AddressSanitizer build, `-nthreads 32` under load | **0 ASan errors** (no heap corruption / leak / UAF) |
-| `-nthreads` 1 / 4 / 8 / 16 / 24 / 32 | all decode clean |
-| Client disconnect + reconnect ×3 | clean (per-thread generation guard) |
+| AddressSanitizer build, real 32 threads under load | **0 ASan errors** (no corruption / leak / UAF) |
+| Real 32 threads, 2560×1440, 198k+ Tight rectangles | **0 decode errors** |
+| 9-minute hard-transition stress, **2 simultaneous clients**, 62k+ rectangles | **0 decode errors** |
+| `-nthreads` 1 / 2 / 4 / 8 / 16 / 32 | all decode clean |
+| Client disconnect + reconnect | clean (client-generation guard) |
 | Tiny window 240×6, `-nthreads 32` | no crash, no SIGFPE (zero-height-strip guard) |
-| Patched viewer end-to-end decode | clean (reset-bit handshake works) |
 
-Recommended on your real box: also run `-nthreads` 4/8/16/32 benchmarks
-(`TVNC_PROFILE=1` env logs encoder throughput) to find your knee.
+The transition stress (mixed big + small updates, the workload that exposes
+zlib-stream desync) is the key test — it caught two earlier incomplete fixes
+before the final sticky-reset design passed it cleanly.
+
+### Benchmark
+
+Encode time per frame, full-screen incompressible updates (worst case),
+8-core Rocky 8 VM:
+
+| threads | encode/frame | speedup vs 1 |
+|---------|--------------|--------------|
+| 1 | 44.0 ms | 1.00× |
+| 2 | 22.4 ms | 1.96× |
+| 4 | 14.0 ms | 3.15× |
+| 8 | 15.0 ms | 2.94× |
+| 16 | 12.3 ms | 3.57× |
+| 32 | 11.4 ms | 3.85× |
+
+Near-linear scaling to 4 threads; it flattens past the VM's 8-core budget
+(the benchmark's screen-blitter and the viewer also consume cores). 32 threads
+on 8 cores still gave the best result with **no contention regression**. On an
+80-core box with GPU-side VirtualGL rendering there is far more CPU headroom,
+so the scaling extends further — benchmark `-nthreads` 4 / 8 / 16 / 32 on your
+real workload (`TVNC_PROFILE=1` logs encoder throughput) to find your knee.

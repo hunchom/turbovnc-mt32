@@ -129,6 +129,9 @@ typedef struct PALETTE_s {
 
 static Bool threadInit = FALSE;
 static pthread_t thnd[MAX_ENCODING_THREADS] = { 0 };
+/* cross-frame zlib-stream continuity tracking (written single-threaded). */
+static int tightLastNt = 0;
+static unsigned int tightLastClientGen = 0;
 
 typedef struct _threadparam {
   rfbClientPtr cl;
@@ -149,8 +152,7 @@ typedef struct _threadparam {
   z_stream zs[4];
   Bool zsActive[4];
   int zsLevel[4];
-  Bool resetStream[4];     /* next subrect on wire id k must carry reset bit */
-  unsigned int clientGen;  /* generation of client these zs belong to */
+  Bool resetStream[4];     /* this frame: wire id k needs a stream reset */
   pthread_mutex_t ready, done;
   Bool status, deadyet;
   RegionRec lossyRegion, losslessRegion;
@@ -299,6 +301,8 @@ static void InitThreads(void)
 
   memset(tparam, 0, sizeof(threadparam) * MAX_ENCODING_THREADS);
   /* zs[] left zeroed -> lazy deflateInit2 in CompressData on first use. */
+  tightLastNt = 0;
+  tightLastClientGen = 0;
   tparam[0].ublen = &ublen;
   tparam[0].updateBuf = updateBuf;
   for (i = 1; i < MAX_ENCODING_THREADS; i++) {
@@ -402,7 +406,7 @@ static Bool CheckUpdateBuf(threadparam *t, int bytes)
 
 Bool rfbSendRectEncodingTight(rfbClientPtr cl, int x, int y, int w, int h)
 {
-  Bool status = TRUE;
+  Bool status = TRUE, resetAll;
   int i, nt;
 
   if (!threadInit) {
@@ -424,6 +428,15 @@ Bool rfbSendRectEncodingTight(rfbClientPtr cl, int x, int y, int w, int h)
   nt = min(nt, h);                    /* never a 0-height strip */
   if (nt < 1) nt = 1;
 
+  /* A wire zlib stream stays continuous across frames only while the same
+     thread keeps writing it.  Reset every stream this frame if: >4 threads
+     share the 4 wire ids; OR nt changed (thread<->id mapping shifted); OR a
+     different client encoded last (per-thread zs carry its history). */
+  resetAll = (nt > 4) || (nt != tightLastNt) ||
+             (cl->generation != tightLastClientGen);
+  tightLastNt = nt;
+  tightLastClientGen = cl->generation;
+
   for (i = 0; i < nt; i++) {
     tparam[i].status = TRUE;
     tparam[i].cl = cl;
@@ -436,29 +449,30 @@ Bool rfbSendRectEncodingTight(rfbClientPtr cl, int x, int y, int w, int h)
       REGION_INIT(pScreen, &tparam[i].lossyRegion, NullBox, 0);
       REGION_INIT(pScreen, &tparam[i].losslessRegion, NullBox, 0);
     }
-    tparam[i].resetStream[0] = tparam[i].resetStream[1] =
-      tparam[i].resetStream[2] = tparam[i].resetStream[3] = FALSE;
-    /* Tight has only 4 wire zlib stream ids (0..3).  nt<=4: divide the 4 ids
-       disjointly, streams persist cross-frame, no resets -> wire output
-       byte-identical to stock.  nt>4: pin thread i to wire id i%4, deflate
-       through its own t->zs, reset that id before the thread's first zlib
-       subrect so the client realigns its inflate context. */
+    /* Tight has only 4 wire zlib stream ids (0..3).  Assign threads to ids.
+       resetStream[k] is sticky: set here when continuity broke (resetAll),
+       and stays set until the thread actually emits a reset on id k
+       (CompressData clears it).  A thread that owns k but skips it for some
+       frames (empty strip) therefore still resets k on its next use. */
     if (nt <= 4) {
       if (i < 4) {
-        int n = min(nt, 4);
+        int n = min(nt, 4), b;
         tparam[i].baseStreamId = 4 / n * i;
         if (i == n - 1) tparam[i].nStreams = 4 - tparam[i].baseStreamId;
         else tparam[i].nStreams = 4 / n;
         tparam[i].streamId = tparam[i].baseStreamId;
+        if (resetAll)
+          for (b = tparam[i].baseStreamId;
+               b < tparam[i].baseStreamId + tparam[i].nStreams; b++)
+            tparam[i].resetStream[b] = TRUE;
       }
     } else {
       int wireId = i % 4;
       tparam[i].baseStreamId = wireId;       /* single wire id */
       tparam[i].nStreams = 0;                /* no round-robin */
       tparam[i].streamId = wireId;
-      /* >4 threads share 4 wire ids -> every strip resets its stream each
-         frame so client inflater realigns; no cross-frame history kept. */
-      tparam[i].resetStream[wireId] = TRUE;
+      if (resetAll)
+        tparam[i].resetStream[wireId] = TRUE;
     }
   }
   if (nt > 1) {
@@ -1004,7 +1018,8 @@ static Bool SendMonoRect(threadparam *t, int w, int h)
   else
     t->updateBuf[(*t->ublen)++] =
       (char)(((streamId | rfbTightExplicitFilter) << 4) |
-             (t->resetStream[streamId] ? (1 << streamId) : 0));
+             ((!t->zsActive[streamId] || t->resetStream[streamId]) ?
+              (1 << streamId) : 0));
   t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
   t->updateBuf[(*t->ublen)++] = 1;
 
@@ -1074,7 +1089,8 @@ static Bool SendIndexedRect(threadparam *t, int w, int h)
   else
     t->updateBuf[(*t->ublen)++] =
       (char)(((streamId | rfbTightExplicitFilter) << 4) |
-             (t->resetStream[streamId] ? (1 << streamId) : 0));
+             ((!t->zsActive[streamId] || t->resetStream[streamId]) ?
+              (1 << streamId) : 0));
   t->updateBuf[(*t->ublen)++] = rfbTightFilterPalette;
   t->updateBuf[(*t->ublen)++] = (char)(t->paletteNumColors - 1);
 
@@ -1141,7 +1157,8 @@ static Bool SendFullColorRect(threadparam *t, int w, int h)
   else
     t->updateBuf[(*t->ublen)++] =
       (char)((streamId << 4) |
-             (t->resetStream[streamId] ? (1 << streamId) : 0));
+             ((!t->zsActive[streamId] || t->resetStream[streamId]) ?
+              (1 << streamId) : 0));
   t->bytessent++;
 
   if (usePixelFormat24) {
@@ -1173,19 +1190,6 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
   if (zlibLevel == 0 && cl->enableTightWithoutZlib)
     return SendCompressedData(t, t->tightBeforeBuf, dataLen);
 
-  /* tparam[] is process-global -> a thread's zs may carry a prior client's
-     deflate history.  on client change, end every active stream. */
-  if (t->clientGen != cl->generation) {
-    int s;
-    for (s = 0; s < 4; s++) {
-      if (t->zsActive[s]) {
-        deflateEnd(&t->zs[s]);
-        t->zsActive[s] = FALSE;
-      }
-    }
-    t->clientGen = cl->generation;
-  }
-
   pz = &t->zs[streamId];
 
   /* Initialize compression stream if needed. */
@@ -1202,8 +1206,8 @@ static Bool CompressData(threadparam *t, int streamId, int dataLen,
     t->zsActive[streamId] = TRUE;
     t->zsLevel[streamId] = zlibLevel;
   } else if (t->resetStream[streamId]) {
-    /* shared wire id -> restart server deflate history to match the
-       inflateReset the client does on the reset bit. */
+    /* continuity broke -> restart deflate history to match the inflateReset
+       the client does on the reset bit emitted in the control byte. */
     if (deflateReset(pz) != Z_OK)
       return FALSE;
   }

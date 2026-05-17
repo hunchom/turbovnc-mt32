@@ -11,16 +11,19 @@ The Tight wire protocol has only 4 zlib stream IDs; stock TurboVNC shares 4
 `z_stream`s per client, so >4 encoder threads would `deflate()` the same
 stream concurrently → heap corruption. This patch gives every thread its own
 zlib contexts and reuses the 4 wire IDs with a per-frame stream-reset
-handshake, so the cap can safely go to 32. `nt <= 4` stays byte-identical to
-stock — all new behavior is confined to the `nt > 4` path.
+handshake, so the cap can safely go to 32. A wire stream is reset whenever
+its cross-frame continuity breaks (>4 threads, thread-count change, or client
+change); a sticky reset flag guarantees no reset is ever missed.
 
 ## Verified
 
 Built and run on Rocky 8 / RHEL 8 (`Xvnc 3.3.1.mt32`):
 
-- Real **32 threads** at 2560×1440, 46k+ Tight rectangles — **0 decode errors**
-- **AddressSanitizer** clean under `-nthreads 32` load (no corruption / leak / UAF)
-- Clean across `-nthreads` 1/4/8/16/24/32, client reconnects, and tiny windows
+- Real **32 threads** at 2560×1440, 198k+ Tight rectangles — **0 decode errors**
+- **9-minute hard-transition stress, 2 simultaneous clients**, 62k+ rectangles — **0 decode errors**
+- **AddressSanitizer** clean under real-32-thread load (no corruption / leak / UAF)
+- Clean across `-nthreads` 1/2/4/8/16/32, client reconnects, and tiny windows
+- Benchmark: **3.15× faster** full-screen encode at 4 threads (8-core VM)
 
 ## Contents
 
